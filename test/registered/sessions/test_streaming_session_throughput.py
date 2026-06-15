@@ -6,11 +6,10 @@ few tokens per turn. The model is truncated to a few layers and overlap
 scheduling is disabled, shrinking the GPU forward so the per-step, O(resident
 context) scheduler work (batch assembly, prefix match, KV bookkeeping) lands on
 the critical path. This catches end-to-end regressions of those paths -- e.g.
-#27965 (in-place fill_ids reconstruction): H200 ~3675 vs ~3367 tok/s reverted.
+#27965 (in-place fill_ids reconstruction).
 
-A warmup pass precedes the timed measurement (the first pass is cold on a fresh
-server). The floor is provisional: CI runs on H100 (1-gpu-large), so retune it
-from the first CI run's printed throughput.
+The floor is set 3% under the measured throughput on the CI runner
+(1-gpu-large = H100); see THROUGHPUT_FLOOR_TOK_S for the data and run.
 """
 
 import concurrent.futures
@@ -28,35 +27,33 @@ from sglang.test.server_fixtures.streaming_session_fixture import (
     StreamingSessionServerBase,
 )
 
-register_cuda_ci(est_time=300, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=300, stage="extra-b", runner_config="4-gpu-h100")
 
 NUM_HIDDEN_LAYERS = 3
 NUM_CONCURRENT = 16
 CONTEXT_LEN = 30000
 NUM_TURNS = 100
-INPUT_LEN = 10
-MIN_GEN_LEN = 1
-MAX_GEN_LEN = 16
 
-TOKEN_ID_START = 1000
-TOKEN_ID_COUNT = 1024
-
-# Provisional; CI is H100, retune from the first run (H200: ~3675 vs ~3367).
-THROUGHPUT_FLOOR_TOK_S = 2600.0
+# Floor = 3% under the measured throughput on the CI runner (1-gpu-large = H100):
+# with #27965 -> 3117.5 tok/s, reverted -> ~2586 tok/s (~17% slower, caught).
+# Calibration run: https://github.com/sgl-project/sglang/actions/runs/27532270238
+THROUGHPUT_FLOOR_TOK_S = 3024.0
 
 
 @dataclass
-class SessionState:
+class _Session:
     session_id: str
     rid: Optional[str]
 
 
-def _synthetic_input_ids(length: int, seed: int) -> list[int]:
-    return [TOKEN_ID_START + ((seed + i) % TOKEN_ID_COUNT) for i in range(length)]
+def _synthetic_input_ids(
+    length: int, seed: int, token_id_start: int, token_id_count: int
+) -> list[int]:
+    return [token_id_start + ((seed + i) % token_id_count) for i in range(length)]
 
 
 def _stream_generate(
-    base_url: str, input_ids: list[int], session: SessionState, output_len: int
+    base_url: str, input_ids: list[int], session: _Session, output_len: int
 ) -> int:
     resp = requests.post(
         base_url + "/generate",
@@ -85,6 +82,72 @@ def _stream_generate(
     return completion_tokens
 
 
+def bench_serving_streaming(
+    base_url: str,
+    *,
+    num_sessions: int,
+    context_len: int,
+    num_turns: int,
+    input_len: int = 10,
+    min_gen_len: int = 1,
+    max_gen_len: int = 16,
+    token_id_start: int = 1000,
+    token_id_count: int = 1024,
+    warmup: bool = True,
+) -> dict:
+    def open_and_prime(session_index: int) -> _Session:
+        session_id = requests.post(
+            base_url + "/open_session",
+            json={"capacity_of_str_len": 0, "streaming": True},
+        ).json()
+        session = _Session(session_id=session_id, rid=None)
+        prime_ids = _synthetic_input_ids(
+            context_len, session_index, token_id_start, token_id_count
+        )
+        _stream_generate(base_url, prime_ids, session, output_len=1)
+        return session
+
+    def run_turns(session: _Session, session_index: int) -> int:
+        rng = random.Random(session_index)
+        output_tokens = 0
+        for turn_index in range(num_turns):
+            output_len = rng.randint(min_gen_len, max_gen_len)
+            input_ids = _synthetic_input_ids(
+                input_len,
+                session_index * num_turns + turn_index,
+                token_id_start,
+                token_id_count,
+            )
+            output_tokens += _stream_generate(base_url, input_ids, session, output_len)
+        return output_tokens
+
+    def measure() -> dict:
+        requests.post(base_url + "/flush_cache")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_sessions) as pool:
+            sessions = list(pool.map(open_and_prime, range(num_sessions)))
+            start = time.perf_counter()
+            output_tokens = sum(
+                pool.map(
+                    lambda args: run_turns(*args),
+                    [(session, idx) for idx, session in enumerate(sessions)],
+                )
+            )
+            duration = time.perf_counter() - start
+        for session in sessions:
+            requests.post(
+                base_url + "/close_session", json={"session_id": session.session_id}
+            )
+        return {
+            "output_throughput": output_tokens / duration,
+            "total_output_tokens": output_tokens,
+            "duration_s": duration,
+        }
+
+    if warmup:
+        measure()  # cold on a fresh server; discard
+    return measure()
+
+
 class TestStreamingSessionThroughput(StreamingSessionServerBase):
     model = "Qwen/Qwen3-0.6B"
     extra_args = [
@@ -100,53 +163,14 @@ class TestStreamingSessionThroughput(StreamingSessionServerBase):
         "--disable-overlap-schedule",
     ]
 
-    def _open_and_prime(self, session_index: int) -> SessionState:
-        session_id = requests.post(
-            self.base_url + "/open_session",
-            json={"capacity_of_str_len": 0, "streaming": True},
-        ).json()
-        session = SessionState(session_id=session_id, rid=None)
-        prime_ids = _synthetic_input_ids(CONTEXT_LEN, seed=session_index)
-        _stream_generate(self.base_url, prime_ids, session, output_len=1)
-        return session
-
-    def _run_turns(self, session: SessionState, session_index: int) -> int:
-        rng = random.Random(session_index)
-        output_tokens = 0
-        for turn_index in range(NUM_TURNS):
-            output_len = rng.randint(MIN_GEN_LEN, MAX_GEN_LEN)
-            input_ids = _synthetic_input_ids(
-                INPUT_LEN, seed=session_index * NUM_TURNS + turn_index
-            )
-            output_tokens += _stream_generate(
-                self.base_url, input_ids, session, output_len
-            )
-        return output_tokens
-
-    def _measure(self) -> float:
-        """Prime NUM_CONCURRENT sessions to CONTEXT_LEN, run NUM_TURNS short turns
-        each, and return output tok/s over the (post-prime) turn phase."""
-        requests.post(self.base_url + "/flush_cache")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=NUM_CONCURRENT) as pool:
-            sessions = list(pool.map(self._open_and_prime, range(NUM_CONCURRENT)))
-            start = time.perf_counter()
-            output_tokens = sum(
-                pool.map(
-                    lambda args: self._run_turns(*args),
-                    [(session, idx) for idx, session in enumerate(sessions)],
-                )
-            )
-            duration = time.perf_counter() - start
-        for session in sessions:
-            requests.post(
-                self.base_url + "/close_session",
-                json={"session_id": session.session_id},
-            )
-        return output_tokens / duration
-
     def test_streaming_session_throughput(self):
-        self._measure()  # warmup (cold on a fresh server); discard
-        throughput = self._measure()
+        res = bench_serving_streaming(
+            self.base_url,
+            num_sessions=NUM_CONCURRENT,
+            context_len=CONTEXT_LEN,
+            num_turns=NUM_TURNS,
+        )
+        throughput = res["output_throughput"]
         print(
             f"\n[streaming-session throughput] sessions={NUM_CONCURRENT} "
             f"context={CONTEXT_LEN} turns={NUM_TURNS} layers={NUM_HIDDEN_LAYERS}\n"
